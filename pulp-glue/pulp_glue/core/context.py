@@ -1,3 +1,5 @@
+from multiprocess import Pool
+
 import datetime
 import hashlib
 import os
@@ -45,7 +47,11 @@ class PulpArtifactContext(PulpEntityContext):
     ID_PREFIX = "artifacts"
 
     def upload(
-        self, file: t.IO[bytes], chunk_size: int = 1000000, sha256: t.Optional[str] = None
+        self,
+        file: t.IO[bytes],
+        chunk_size: int = 1000000,
+        parallel: bool = False,
+        sha256: t.Optional[str] = None,
     ) -> t.Any:
         size = os.path.getsize(file.name)
 
@@ -74,7 +80,7 @@ class PulpArtifactContext(PulpEntityContext):
             return artifact["pulp_href"]
 
         upload_ctx = PulpUploadContext(self.pulp_ctx)
-        upload_ctx.upload_file(file, chunk_size)
+        upload_ctx.upload_file(file, chunk_size, parallel)
 
         self.pulp_ctx.echo(_("Creating artifact."), err=True)
         try:
@@ -492,8 +498,17 @@ class PulpUploadContext(PulpEntityContext):
             body={"sha256": sha256},
         )
 
-    def upload_file(self, file: t.IO[bytes], chunk_size: int = 1000000) -> t.Any:
+    def upload_file(
+        self, file: t.IO[bytes], chunk_size: int = 1000000, parallel: bool = False
+    ) -> t.Any:
         """Upload a file and return the uncommitted upload_href."""
+        if parallel:
+            self.upload_file_in_parallel(file, chunk_size)
+        else:
+            self.upload_file_in_serial(file, chunk_size)
+
+    def upload_file_in_serial(self, file: t.IO[bytes], chunk_size: int = 1000000):
+        """Upload a file in serial and return uncommitted upload_href."""
         start = 0
         size = os.path.getsize(file.name)
         upload_href = self.create(body={"size": size})["pulp_href"]
@@ -513,6 +528,51 @@ class PulpUploadContext(PulpEntityContext):
             raise e
         self.pulp_ctx.echo(_("Upload complete."), err=True)
         return upload_href
+
+    def upload_file_in_parallel(self, file: t.IO[bytes], chunk_size: int = 1000000) -> t.Any:
+        """Upload a file in 4 processes and return the uncommitted upload_href."""
+
+        size = os.path.getsize(file.name)
+        piece_size = size // 4
+        last_piece_size = size - piece_size * 4
+        upload_href = self.create(body={"size": size})["pulp_href"]
+
+        args = [
+            [self, upload_href, size, chunk_size, file, 0, piece_size],
+            [self, upload_href, size, chunk_size, file, piece_size, 2 * piece_size],
+            [self, upload_href, size, chunk_size, file, 2 * piece_size, 3 * piece_size],
+            [self, upload_href, size, chunk_size, file, 3 * piece_size, 4 * piece_size],
+            ]
+        if last_piece_size:
+            args.append(
+                [self, upload_href, size, chunk_size, file, 4 * piece_size + 1, 4 * piece_size + last_piece_size])  # noqa
+        pool = Pool(processes=len(args))
+        pool.map(up, args)
+
+        return upload_href
+
+
+def up(args):
+    self, upload_href, size, chunk_size, file, start, p_size = args
+    try:
+        file.seek(start)
+        self.pulp_href = upload_href
+        while start < p_size:
+            if (start + chunk_size) > p_size:
+                chunk = file.read(p_size - start)
+            else:
+                chunk = file.read(chunk_size)
+            self.upload_chunk(
+                chunk=chunk,
+                size=size,
+                start=start,
+            )
+            start += chunk_size
+            self.pulp_ctx.echo(".", nl=False, err=True)
+    except Exception as e:
+        self.delete(upload_href)
+        raise e
+    self.pulp_ctx.echo(_("Upload complete."), err=True)
 
 
 class PulpUserContext(PulpEntityContext):
